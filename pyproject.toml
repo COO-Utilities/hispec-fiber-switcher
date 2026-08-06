@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hispec-fiber-switcher"
+version = "0.1.0"
+description = "Python driver for the HISPEC fiber-optic port switcher PLC"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "hardware_device_base @ git+https://github.com/COO-Utilities/hardware_device_base.git",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+py-modules = ["fiber_switcher"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
