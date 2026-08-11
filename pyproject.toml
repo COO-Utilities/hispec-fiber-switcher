@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 license = {text = "MIT"}
 dependencies = [
     "hardware_device_base @ git+https://github.com/COO-Utilities/hardware_device_base.git",
+    "pymcprotocol>=0.3.0",
 ]
 
 [project.optional-dependencies]

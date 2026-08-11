@@ -49,3 +49,12 @@ with FiberSwitcher() as switcher:
     switcher.connect("192.168.0.183", 9001)
     switcher.home()
 ```
+
+## Implementation
+
+The switcher's PLC speaks the Mitsubishi MELSEC MC protocol (3E frame,
+ASCII) over TCP. This driver delegates protocol framing, device addressing, and error decoding to [`pymcprotocol`](https://pypi.org/project/pymcprotocol/)'s `Type3E` client.
+Errors from the PLC (bad device, bad value, unsupported command, etc.)
+surface directly as `pymcprotocol.mcprotocolerror.MCProtocolError` (which
+carries the PLC's own error code) or `UnsupportedComandError`, rather than
+a generic exception.

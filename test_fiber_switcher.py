@@ -1,45 +1,62 @@
-"""Tests for the fiber switcher driver."""
+"""Tests for the fiber switcher driver.
 
-from unittest.mock import MagicMock, patch
+`FiberSwitcher` delegates protocol I/O to `pymcprotocol.Type3E`, so these
+tests mock that client rather than a raw socket and assert on the
+device/value arguments passed to it.
+"""
+
+from unittest.mock import call, patch
 
 import pytest
+from pymcprotocol.mcprotocolerror import MCProtocolError
 
 import fiber_switcher as fs
 from fiber_switcher import FiberSwitcher
 
-ACK = "D00000FF03FF0000040000"
-STATUS_REPLY = (
-    "D00000FF03FF00003C00000104010200010001AFC8000003E80000753000000000000000040010"
-)
+
+def _signed16(hex_str: str) -> int:
+    """Convert a 4-hex-char word to the signed 16-bit int pymcprotocol
+    would return for it."""
+    value = int(hex_str, 16)
+    return value - 0x10000 if value >= 0x8000 else value
 
 
-def _mock_connected_switcher(recv_frames):
-    """Return a FiberSwitcher wired to a mock socket that yields the given
-    ASCII frames (each frame split into header(18)+rest bytes) in order."""
-    switcher = FiberSwitcher(log=False)
-    with patch("fiber_switcher.socket.socket") as mock_socket_cls:
-        sock = mock_socket_cls.return_value
-        recv_side_effect = []
-        for frame in recv_frames:
-            recv_side_effect.append(frame[:18].encode("ascii"))
-            recv_side_effect.append(frame[18:].encode("ascii"))
-        sock.recv.side_effect = recv_side_effect
-        switcher.connect("127.0.0.1", 9001)
-    return switcher, sock
+# The 14 status words from the vendor document's worked read-status example.
+STATUS_WORDS = [
+    _signed16(h)
+    for h in (
+        "0104", "0102", "0001", "0001",
+        "AFC8", "0000", "03E8", "0000",
+        "7530", "0000",
+        "0000", "0000", "0004", "0010",
+    )
+]
+
+
+def _connected_switcher():
+    """Return a FiberSwitcher whose `_client` is a mock, already "connected"."""
+    with patch("fiber_switcher.Type3E"):
+        switcher = FiberSwitcher(log=False)
+    client = switcher._client  # pylint: disable=protected-access
+    switcher.connect("127.0.0.1", 9001)
+    return switcher, client
 
 
 def test_connect_and_disconnect():
-    switcher, sock = _mock_connected_switcher([])
+    switcher, client = _connected_switcher()
     assert switcher.is_connected()
     switcher.disconnect()
-    sock.close.assert_called_once()
+    client.close.assert_called_once()
     assert not switcher.is_connected()
 
 
 def test_read_status_parses_all_fields():
-    switcher, sock = _mock_connected_switcher([STATUS_REPLY])
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS
+
     status = switcher.read_status()
 
+    client.batchread_wordunits.assert_called_once_with("W0", 14)
     assert status.port_a_target == 104
     assert status.port_b_target == 102
     assert status.in_position is True
@@ -52,36 +69,36 @@ def test_read_status_parses_all_fields():
     assert status.messages_16_31 == 0x0010
 
 
-def test_set_target_positions_builds_expected_command():
-    switcher, sock = _mock_connected_switcher([ACK])
+def test_set_target_positions_builds_expected_values():
+    switcher, client = _connected_switcher()
     assert switcher.set_target_positions(port_a=5, port_b=2)
-    sent = sock.sendall.call_args[0][0].decode("ascii")
-    assert sent == "500000FF03FF000020000014010000W*000014000201050102"
+    client.batchwrite_wordunits.assert_called_once_with("W0E", [0x0105, 0x0102])
 
 
 @pytest.mark.parametrize("position", [0, 14, -1])
 def test_set_target_positions_rejects_bad_port_a(position):
-    switcher, _sock = _mock_connected_switcher([])
+    switcher = FiberSwitcher(log=False)
     with pytest.raises(ValueError, match="Port A"):
         switcher.set_target_positions(port_a=position, port_b=1)
 
 
 @pytest.mark.parametrize("position", [0, 6, -1])
 def test_set_target_positions_rejects_bad_port_b(position):
-    switcher, _sock = _mock_connected_switcher([])
+    switcher = FiberSwitcher(log=False)
     with pytest.raises(ValueError, match="Port B"):
         switcher.set_target_positions(port_a=1, port_b=position)
 
 
 def test_get_pos_and_set_pos_roundtrip():
-    switcher, sock = _mock_connected_switcher([STATUS_REPLY, STATUS_REPLY, STATUS_REPLY, ACK])
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS
+
     assert switcher.get_pos("A") == 4
     assert switcher.get_pos("B") == 2
 
     switcher.set_pos("A", 7)
-    sent = sock.sendall.call_args[0][0].decode("ascii")
-    # Port B (2, from the status reply's target 0102) is preserved.
-    assert sent == "500000FF03FF000020000014010000W*000014000201070102"
+    # Port B (2, from the mocked status's target 0x0102) is preserved.
+    client.batchwrite_wordunits.assert_called_with("W0E", [0x0107, 0x0102])
 
 
 @pytest.mark.parametrize(
@@ -94,10 +111,9 @@ def test_get_pos_and_set_pos_roundtrip():
     ],
 )
 def test_control_word_commands(method, code):
-    switcher, sock = _mock_connected_switcher([ACK])
+    switcher, client = _connected_switcher()
     assert getattr(switcher, method)()
-    sent = sock.sendall.call_args[0][0].decode("ascii")
-    assert sent == "500000FF03FF00001C0000140200000100W*000012" + code
+    client.randomwrite.assert_called_once_with(["W0C"], [code], [], [])
 
 
 @pytest.mark.parametrize(
@@ -109,100 +125,93 @@ def test_control_word_commands(method, code):
     ],
 )
 def test_clean_modes(mode, code):
-    switcher, sock = _mock_connected_switcher([ACK])
+    switcher, client = _connected_switcher()
     assert switcher.clean(mode)
-    sent = sock.sendall.call_args[0][0].decode("ascii")
-    assert sent == "500000FF03FF00001C0000140200000100W*000012" + code
+    client.randomwrite.assert_called_once_with(["W0C"], [code], [], [])
 
 
 def test_clean_rejects_unknown_mode():
-    switcher, _sock = _mock_connected_switcher([])
+    switcher = FiberSwitcher(log=False)
     with pytest.raises(ValueError, match="Unknown clean mode"):
         switcher.clean("sideways")
 
 
 def test_move_to_rearmost():
-    switcher, sock = _mock_connected_switcher([ACK])
+    switcher, client = _connected_switcher()
     assert switcher.move_to_rearmost()
-    sent = sock.sendall.call_args[0][0].decode("ascii")
-    assert sent == "500000FF03FF00001C000014010000D*00020000010005"
+    client.batchwrite_wordunits.assert_called_once_with("D200", [5])
 
 
 def test_air_purge_open_and_close():
-    switcher, sock = _mock_connected_switcher([ACK, ACK])
+    switcher, client = _connected_switcher()
     switcher.open_air_purge()
-    assert (
-        sock.sendall.call_args_list[0][0][0].decode("ascii")
-        == "500000FF03FF000019000014010001M*00038100011"
-    )
     switcher.close_air_purge()
-    assert (
-        sock.sendall.call_args_list[1][0][0].decode("ascii")
-        == "500000FF03FF000019000014010001M*00038100010"
-    )
+    assert client.batchwrite_bitunits.call_args_list == [
+        call("M381", [1]),
+        call("M381", [0]),
+    ]
 
 
 def test_write_axis_register_encodes_value():
-    switcher, sock = _mock_connected_switcher([ACK])
+    switcher, client = _connected_switcher()
     assert switcher.set_retract_distance_mm(2.56)
-    sent = sock.sendall.call_args[0][0].decode("ascii")
-    assert sent == "500000FF03FF000020000014010000D*001228000201000000"
+    client.batchwrite_wordunits.assert_called_once_with("D1228", [0x0100, 0x0000])
 
 
 def test_set_camera_and_noncamera_insertion_position():
-    switcher, sock = _mock_connected_switcher([ACK, ACK])
+    switcher, client = _connected_switcher()
     switcher.set_camera_insertion_position_mm(22.40)
-    assert (
-        sock.sendall.call_args_list[0][0][0].decode("ascii")
-        == "500000FF03FF000020000014010000D*001250000208C00000"
-    )
     switcher.set_noncamera_insertion_position_mm(34.30)
-    assert (
-        sock.sendall.call_args_list[1][0][0].decode("ascii")
-        == "500000FF03FF000020000014010000D*00125800020D660000"
-    )
+    assert client.batchwrite_wordunits.call_args_list == [
+        call("D1250", [0x08C0, 0x0000]),
+        call("D1258", [0x0D66, 0x0000]),
+    ]
 
 
 def test_write_axis_register_rejects_bad_register():
-    switcher, _sock = _mock_connected_switcher([])
+    switcher = FiberSwitcher(log=False)
     with pytest.raises(ValueError, match="4-digit"):
         switcher.write_axis_register("abcd", 1.0)
 
 
-def test_error_end_code_raises():
-    error_reply = "D00000FF03FF0000040001"  # end code 0001 = error
-    switcher, _sock = _mock_connected_switcher([error_reply])
-    with pytest.raises(RuntimeError, match="error end code"):
+def test_plc_error_propagates():
+    switcher, client = _connected_switcher()
+    client.randomwrite.side_effect = MCProtocolError(0x4031)
+    with pytest.raises(MCProtocolError):
         switcher.stop()
 
 
 def test_home_waits_for_in_position():
-    switcher, _sock = _mock_connected_switcher([ACK, STATUS_REPLY])
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS  # in_position is True
     assert switcher.home(poll_interval=0)
     assert switcher.is_homed()
+    client.randomwrite.assert_called_once_with(["W0C"], [fs.CONTROL_WORD_HOME], [], [])
 
 
 def test_home_raises_on_origin_timeout_alarm():
-    alarm_status = (
-        "D00000FF03FF00003C00000104010200010001AFC8000003E80000753000001000000000040010"
-    )
-    switcher, _sock = _mock_connected_switcher([ACK, alarm_status])
+    switcher, client = _connected_switcher()
+    alarm_words = list(STATUS_WORDS)
+    alarm_words[10] = _signed16("1000")  # alarms_0_15 bit 12
+    client.batchread_wordunits.return_value = alarm_words
     with pytest.raises(RuntimeError, match="origin-return timeout"):
         switcher.home(poll_interval=0)
 
 
 def test_is_loop_closed_reflects_in_position_flag():
-    switcher, _sock = _mock_connected_switcher([STATUS_REPLY])
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS
     assert switcher.is_loop_closed() is True
 
 
 def test_close_loop_is_a_reporting_noop():
-    switcher, _sock = _mock_connected_switcher([STATUS_REPLY])
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS
     assert switcher.close_loop() is True
 
 
 def test_get_limits():
-    switcher, _sock = _mock_connected_switcher([])
+    switcher = FiberSwitcher(log=False)
     assert switcher.get_limits() == {"A": (1, 13), "B": (1, 5)}
 
 
