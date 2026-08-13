@@ -43,19 +43,14 @@ CONTROL_WORD_STOP = 0x0002
 CONTROL_WORD_RETRACT_FIBER = 0x0004
 CONTROL_WORD_INSERT_FIBER = 0x0008
 CONTROL_WORD_MOVE_TO_TARGET = 0x0010
-CONTROL_WORD_CLEAN_INSIDE = 0x0120
-CONTROL_WORD_CLEAN_OUTSIDE = 0x0220
 CONTROL_WORD_CLEAN_BOTH = 0x0320
-
-_CLEAN_MODES = {
-    "inside": CONTROL_WORD_CLEAN_INSIDE,
-    "outside": CONTROL_WORD_CLEAN_OUTSIDE,
-    "both": CONTROL_WORD_CLEAN_BOTH,
-}
 
 AXIS_REGISTER_RETRACT_DISTANCE = "1228"
 AXIS_REGISTER_CAMERA_INSERTION_POSITION = "1250"
 AXIS_REGISTER_NONCAMERA_INSERTION_POSITION = "1258"
+
+CLEAN_POSITION_PORT_A = 10
+CLEAN_POSITION_PORT_B = 2
 
 # Valid position indexes
 PORT_A_POSITIONS: Tuple[int, ...] = tuple(range(1, 14))  # 1-13
@@ -124,6 +119,10 @@ class FiberSwitcher(HardwareMotionBase):
         self.port: int | None = None
         self._homed = False
         self._last_reply: Any | None = None
+
+        # Set after clean() to the known post-clean position, since the PLC
+        # doesn't update its own target registers for that move.
+        self._position_override: tuple[int, int] | None = None
 
     def connect(self, host: str, port: int = DEFAULT_PORT) -> None:  # pylint: disable=W0221
         """Open a TCP connection to the PLC.
@@ -203,6 +202,7 @@ class FiberSwitcher(HardwareMotionBase):
         self._call("randomwrite", [_CONTROL_WORD_DEVICE], [CONTROL_WORD_HOME], [], [])
         self.report_info("Return-to-origin command sent")
         self._homed = False
+        self._position_override = None
         if not wait:
             return True
 
@@ -238,16 +238,18 @@ class FiberSwitcher(HardwareMotionBase):
 
     def get_pos(self, axis: str = "A") -> int:  # pylint: disable=W0221
         """Return the current target position index (1-based) for ``axis``.
-
         :param str axis: "A" or "B".
         """
         axis = axis.upper()
-        status = self.read_status()
-        if axis == "A":
-            return _target_code_to_position(status.port_a_target)
-        if axis == "B":
-            return _target_code_to_position(status.port_b_target)
-        raise ValueError(f"Unknown axis {axis!r}; expected 'A' or 'B'")
+        if axis not in ("A", "B"):
+            raise ValueError(f"Unknown axis {axis!r}; expected 'A' or 'B'")
+        if self._position_override is not None:
+            port_a, port_b = self._position_override
+        else:
+            status = self.read_status()
+            port_a = _target_code_to_position(status.port_a_target)
+            port_b = _target_code_to_position(status.port_b_target)
+        return port_a if axis == "A" else port_b
 
     def get_limits(self) -> Dict[str, Tuple[int, int]]:
         """Return the documented position-index range for each port."""
@@ -274,6 +276,7 @@ class FiberSwitcher(HardwareMotionBase):
             )
         values = [_position_to_bcd_word(port_a), _position_to_bcd_word(port_b)]
         self._call("batchwrite_wordunits", _TARGET_POSITION_DEVICE, values)
+        self._position_override = None
         return True
 
     def set_pos(self, axis: str, position: int) -> bool:  # pylint: disable=W0221
@@ -289,9 +292,8 @@ class FiberSwitcher(HardwareMotionBase):
         axis = axis.upper()
         if axis not in ("A", "B"):
             raise ValueError(f"Unknown axis {axis!r}; expected 'A' or 'B'")
-        status = self.read_status()
-        port_a = position if axis == "A" else _target_code_to_position(status.port_a_target)
-        port_b = position if axis == "B" else _target_code_to_position(status.port_b_target)
+        port_a = position if axis == "A" else self.get_pos("A")
+        port_b = position if axis == "B" else self.get_pos("B")
         return self.set_target_positions(port_a, port_b)
 
     def stop(self) -> bool:
@@ -318,14 +320,17 @@ class FiberSwitcher(HardwareMotionBase):
         self._call("randomwrite", [_CONTROL_WORD_DEVICE], [CONTROL_WORD_MOVE_TO_TARGET], [], [])
         return True
 
-    def clean(self, mode: str = "both") -> bool:
+    def clean(self) -> bool:
         """Start a cleaning cycle.
 
-        :param str mode: Either "inside", "outside", or "both".
+        The PLC moves the mechanism to a fixed position
+        (`CLEAN_POSITION_PORT_A`/`CLEAN_POSITION_PORT_B`) for cleaning
+        without updating its own target-position registers, so
+        `get_pos()` is overridden to reflect that until the next
+        `set_target_positions()` or `home()`.
         """
-        if mode not in _CLEAN_MODES:
-            raise ValueError(f"Unknown clean mode {mode!r}; expected one of {sorted(_CLEAN_MODES)}")
-        self._call("randomwrite", [_CONTROL_WORD_DEVICE], [_CLEAN_MODES[mode]], [], [])
+        self._call("randomwrite", [_CONTROL_WORD_DEVICE], [CONTROL_WORD_CLEAN_BOTH], [], [])
+        self._position_override = (CLEAN_POSITION_PORT_A, CLEAN_POSITION_PORT_B)
         return True
 
     def move_to_rearmost(self) -> bool:

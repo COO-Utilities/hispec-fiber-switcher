@@ -116,24 +116,47 @@ def test_control_word_commands(method, code):
     client.randomwrite.assert_called_once_with(["W0C"], [code], [], [])
 
 
-@pytest.mark.parametrize(
-    "mode,code",
-    [
-        ("inside", fs.CONTROL_WORD_CLEAN_INSIDE),
-        ("outside", fs.CONTROL_WORD_CLEAN_OUTSIDE),
-        ("both", fs.CONTROL_WORD_CLEAN_BOTH),
-    ],
-)
-def test_clean_modes(mode, code):
+def test_clean_sends_clean_both():
     switcher, client = _connected_switcher()
-    assert switcher.clean(mode)
-    client.randomwrite.assert_called_once_with(["W0C"], [code], [], [])
+    assert switcher.clean()
+    client.randomwrite.assert_called_once_with(["W0C"], [fs.CONTROL_WORD_CLEAN_BOTH], [], [])
 
 
-def test_clean_rejects_unknown_mode():
-    switcher = FiberSwitcher(log=False)
-    with pytest.raises(ValueError, match="Unknown clean mode"):
-        switcher.clean("sideways")
+def test_get_pos_reflects_clean_position_override():
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS  # target still 104/102
+
+    switcher.clean()
+
+    # get_pos() must reflect the known post-clean position, not the PLC's
+    # stale target registers.
+    assert switcher.get_pos("A") == fs.CLEAN_POSITION_PORT_A
+    assert switcher.get_pos("B") == fs.CLEAN_POSITION_PORT_B
+    client.batchread_wordunits.assert_not_called()
+
+
+def test_set_target_positions_clears_clean_override():
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS
+
+    switcher.clean()
+    switcher.set_target_positions(port_a=3, port_b=1)
+    switcher.get_pos("A")
+
+    # get_pos() must go back to reading the PLC live instead of returning
+    # the cached clean-position override.
+    client.batchread_wordunits.assert_called_once_with("W0", 14)
+
+
+def test_home_clears_clean_override():
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS
+
+    switcher.clean()
+    switcher.home(poll_interval=0)
+
+    assert switcher.get_pos("A") == 4  # back to reading the PLC's own status
+    client.batchread_wordunits.assert_called_with("W0", 14)
 
 
 def test_move_to_rearmost():
