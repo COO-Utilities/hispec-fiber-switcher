@@ -116,10 +116,30 @@ def test_control_word_commands(method, code):
     client.randomwrite.assert_called_once_with(["W0C"], [code], [], [])
 
 
-def test_clean_sends_clean_both():
+@pytest.mark.parametrize(
+    "mode,code",
+    [
+        ("inside", fs.CONTROL_WORD_CLEAN_INSIDE),
+        ("outside", fs.CONTROL_WORD_CLEAN_OUTSIDE),
+        ("both", fs.CONTROL_WORD_CLEAN_BOTH),
+    ],
+)
+def test_clean_modes(mode, code):
+    switcher, client = _connected_switcher()
+    assert switcher.clean(mode)
+    client.randomwrite.assert_called_once_with(["W0C"], [code], [], [])
+
+
+def test_clean_defaults_to_both():
     switcher, client = _connected_switcher()
     assert switcher.clean()
     client.randomwrite.assert_called_once_with(["W0C"], [fs.CONTROL_WORD_CLEAN_BOTH], [], [])
+
+
+def test_clean_rejects_unknown_mode():
+    switcher = FiberSwitcher(log=False)
+    with pytest.raises(ValueError, match="Unknown clean mode"):
+        switcher.clean("sideways")
 
 
 def test_get_pos_reflects_clean_position_override():
@@ -133,6 +153,19 @@ def test_get_pos_reflects_clean_position_override():
     assert switcher.get_pos("A") == fs.CLEAN_POSITION_PORT_A
     assert switcher.get_pos("B") == fs.CLEAN_POSITION_PORT_B
     client.batchread_wordunits.assert_not_called()
+
+
+def test_read_status_reflects_clean_position_override():
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = STATUS_WORDS  # raw registers still 104/102
+
+    switcher.clean()
+    status = switcher.read_status()
+
+    # read_status() must agree with get_pos(), not echo the PLC's stale
+    # target registers.
+    assert status.port_a_target == 100 + fs.CLEAN_POSITION_PORT_A
+    assert status.port_b_target == 100 + fs.CLEAN_POSITION_PORT_B
 
 
 def test_set_target_positions_clears_clean_override():
@@ -195,6 +228,31 @@ def test_write_axis_register_rejects_bad_register():
     switcher = FiberSwitcher(log=False)
     with pytest.raises(ValueError, match="4-digit"):
         switcher.write_axis_register("abcd", 1.0)
+
+
+def test_read_axis_register_decodes_value():
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = [0x0100, 0x0000]
+    assert switcher.get_retract_distance_mm() == 2.56
+    client.batchread_wordunits.assert_called_once_with("D1228", 2)
+
+
+def test_get_camera_and_noncamera_insertion_position():
+    switcher, client = _connected_switcher()
+    client.batchread_wordunits.return_value = [0x08C0, 0x0000]
+    assert switcher.get_camera_insertion_position_mm() == 22.40
+    client.batchread_wordunits.return_value = [0x0D66, 0x0000]
+    assert switcher.get_noncamera_insertion_position_mm() == 34.30
+    assert client.batchread_wordunits.call_args_list == [
+        call("D1250", 2),
+        call("D1258", 2),
+    ]
+
+
+def test_read_axis_register_rejects_bad_register():
+    switcher = FiberSwitcher(log=False)
+    with pytest.raises(ValueError, match="4-digit"):
+        switcher.read_axis_register("abcd")
 
 
 def test_plc_error_propagates():

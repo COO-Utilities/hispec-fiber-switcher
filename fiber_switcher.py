@@ -43,7 +43,15 @@ CONTROL_WORD_STOP = 0x0002
 CONTROL_WORD_RETRACT_FIBER = 0x0004
 CONTROL_WORD_INSERT_FIBER = 0x0008
 CONTROL_WORD_MOVE_TO_TARGET = 0x0010
+CONTROL_WORD_CLEAN_INSIDE = 0x0120
+CONTROL_WORD_CLEAN_OUTSIDE = 0x0220
 CONTROL_WORD_CLEAN_BOTH = 0x0320
+
+_CLEAN_MODES = {
+    "inside": CONTROL_WORD_CLEAN_INSIDE,
+    "outside": CONTROL_WORD_CLEAN_OUTSIDE,
+    "both": CONTROL_WORD_CLEAN_BOTH,
+}
 
 AXIS_REGISTER_RETRACT_DISTANCE = "1228"
 AXIS_REGISTER_CAMERA_INSERTION_POSITION = "1250"
@@ -90,6 +98,11 @@ def _target_code_to_position(code: int) -> int:
     """Convert a target code back to a position.
     """
     return code - 100
+
+
+def _position_to_target_code(position: int) -> int:
+    """Inverse of `_target_code_to_position`."""
+    return position + 100
 
 
 class FiberSwitcher(HardwareMotionBase):
@@ -175,11 +188,17 @@ class FiberSwitcher(HardwareMotionBase):
         return self._read_reply()
 
     def read_status(self) -> SwitcherStatus:
-        """Read and parse the PLC's full device-status reply (section 1)."""
+        """Read and parse the PLC's full device-status reply."""
         words = [value & 0xFFFF for value in self._call("batchread_wordunits", _STATUS_HEAD_DEVICE, _STATUS_WORD_COUNT)]
+        if self._position_override is not None:
+            port_a_target = _position_to_target_code(self._position_override[0])
+            port_b_target = _position_to_target_code(self._position_override[1])
+        else:
+            port_a_target = int(f"{words[0]:04X}")
+            port_b_target = int(f"{words[1]:04X}")
         return SwitcherStatus(
-            port_a_target=int(f"{words[0]:04X}"),
-            port_b_target=int(f"{words[1]:04X}"),
+            port_a_target=port_a_target,
+            port_b_target=port_b_target,
             in_position=words[2] == 1,
             insertion_state=words[3],
             horizontal_axis_position=words[4] | (words[5] << 16),
@@ -320,16 +339,14 @@ class FiberSwitcher(HardwareMotionBase):
         self._call("randomwrite", [_CONTROL_WORD_DEVICE], [CONTROL_WORD_MOVE_TO_TARGET], [], [])
         return True
 
-    def clean(self) -> bool:
+    def clean(self, mode: str = "both") -> bool:
         """Start a cleaning cycle.
 
-        The PLC moves the mechanism to a fixed position
-        (`CLEAN_POSITION_PORT_A`/`CLEAN_POSITION_PORT_B`) for cleaning
-        without updating its own target-position registers, so
-        `get_pos()` is overridden to reflect that until the next
-        `set_target_positions()` or `home()`.
+        :param str mode: One of "inside", "outside", or "both".
         """
-        self._call("randomwrite", [_CONTROL_WORD_DEVICE], [CONTROL_WORD_CLEAN_BOTH], [], [])
+        if mode not in _CLEAN_MODES:
+            raise ValueError(f"Unknown clean mode {mode!r}; expected one of {sorted(_CLEAN_MODES)}")
+        self._call("randomwrite", [_CONTROL_WORD_DEVICE], [_CLEAN_MODES[mode]], [], [])
         self._position_override = (CLEAN_POSITION_PORT_A, CLEAN_POSITION_PORT_B)
         return True
 
@@ -368,17 +385,42 @@ class FiberSwitcher(HardwareMotionBase):
         self._call("batchwrite_wordunits", f"D{register}", values)
         return True
 
+    def read_axis_register(self, register: str) -> float:
+        """Read a 0.01 mm-resolution axis-setting register.
+
+        :param str register: The 4-digit D-device register number.
+        :return: The register's value in millimeters.
+        """
+        if not (register.isdigit() and len(register) == 4):
+            raise ValueError(f"register must be a 4-digit numeric string, got {register!r}")
+        low, high = (
+            value & 0xFFFF for value in self._call("batchread_wordunits", f"D{register}", 2)
+        )
+        return (low | (high << 16)) / 100
+
     def set_retract_distance_mm(self, value_mm: float) -> bool:
         """Set the insertion/removal axis's retract-back distance."""
         return self.write_axis_register(AXIS_REGISTER_RETRACT_DISTANCE, value_mm)
+
+    def get_retract_distance_mm(self) -> float:
+        """Get the insertion/removal axis's retract-back distance."""
+        return self.read_axis_register(AXIS_REGISTER_RETRACT_DISTANCE)
 
     def set_camera_insertion_position_mm(self, value_mm: float) -> bool:
         """Set the insertion position used for camera observation ports."""
         return self.write_axis_register(AXIS_REGISTER_CAMERA_INSERTION_POSITION, value_mm)
 
+    def get_camera_insertion_position_mm(self) -> float:
+        """Get the insertion position used for camera observation ports."""
+        return self.read_axis_register(AXIS_REGISTER_CAMERA_INSERTION_POSITION)
+
     def set_noncamera_insertion_position_mm(self, value_mm: float) -> bool:
         """Set the insertion position used for non-camera observation ports."""
         return self.write_axis_register(AXIS_REGISTER_NONCAMERA_INSERTION_POSITION, value_mm)
+
+    def get_noncamera_insertion_position_mm(self) -> float:
+        """Get the insertion position used for non-camera observation ports."""
+        return self.read_axis_register(AXIS_REGISTER_NONCAMERA_INSERTION_POSITION)
 
     def __enter__(self) -> "FiberSwitcher":
         return self
